@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import functools
 
 import cv2
 import numpy as np
@@ -11,7 +12,11 @@ import tensorboardX
 import torch
 import torch.optim as optim
 import torch.utils.data
+from torch.optim import AdamW
 from torchsummary import summary
+
+from diffusion.resample import create_named_schedule_sampler
+from diffusion.fp16_util import MixedPrecisionTrainer
 
 from hardware.device import get_device
 from inference.models import get_network
@@ -19,13 +24,14 @@ from inference.post_process import post_process_output
 from utils.data import get_dataset
 from utils.dataset_processing import evaluation
 from utils.visualisation.gridshow import gridshow
+from utils.model_util import create_diffusion
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train network')
 
     # Network
-    parser.add_argument('--network', type=str, default='lgrconvnet3',
+    parser.add_argument('--network', type=str, default='lgdm',
                         help='Network name in inference/models')
     parser.add_argument('--input-size', type=int, default=224,
                         help='Input image size for the network')
@@ -41,6 +47,8 @@ def parse_args():
                         help='Internal channel size for the network')
     parser.add_argument('--iou-threshold', type=float, default=0.25,
                         help='Threshold for IOU matching')
+    parser.add_argument('--load-checkpoint-path', type=str, default="",
+                        help='checkpoint for resume training')
 
     # Datasets
     parser.add_argument('--dataset', type=str,
@@ -82,13 +90,16 @@ def parse_args():
                         help='Data split: train, test_seen, test_unseen') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
-    parser.add_argument('--eval-every-n-steps', type=int, default=5000)
+    parser.add_argument('--eval-every-n-steps', type=int, default=1000)
+
+    parser.add_argument('--resume', type=bool, default=False)
+    parser.add_argument('--checkpoint_path', type=str, default="")
     
     args = parser.parse_args()
     return args
 
 
-def validate(net, device, val_data, iou_threshold):
+def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
     """
     Run validation.
     :param net: Network
@@ -98,6 +109,10 @@ def validate(net, device, val_data, iou_threshold):
     :return: Successes, Failures and Losses
     """
     net.eval()
+
+    sample_fn = (
+            diffusion.p_sample_loop
+    )
 
     results = {
         'correct': 0,
@@ -112,10 +127,27 @@ def validate(net, device, val_data, iou_threshold):
 
     with torch.no_grad():
         for x, y, data_idx, rot, zoom_factor, prompt, query, _, _, _ in val_data:
-            xc = x.to(device)
+            img = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query)
+            pos_gt = yc[0]
 
+            alpha = 0.4
+            idx = torch.ones(img.shape[0]).to(device)
+
+            sample = sample_fn(
+                net,
+                pos_gt.shape,
+                pos_gt,
+                img,
+                query,
+                alpha,
+                idx,
+            )
+
+            pos_output = sample
+            cos_output, sin_output, width_output = net.cos_output_str, net.sin_output_str, net.width_output_str
+
+            lossd = net.compute_loss(yc, pos_output, cos_output, sin_output, width_output)
             loss = lossd['loss']
 
             results['loss'] += loss.item() / ld
@@ -143,7 +175,7 @@ def validate(net, device, val_data, iou_threshold):
     return results
 
 
-def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=False):
+def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer, batches_per_epoch, val_data, iou_threshold, tb, save_folder, best_iou, vis=False, eval_every_n_steps=5000):
     """
     Run one training epoch
     :param epoch: Current epoch
@@ -161,7 +193,23 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
         }
     }
 
+    use_fp16 = False
+    fp16_scale_growth = 1e-3
+    mp_trainer = MixedPrecisionTrainer(
+            model=net,
+            use_fp16=use_fp16,
+            fp16_scale_growth=fp16_scale_growth,
+    )
+    optimizer = AdamW(
+        mp_trainer.master_params, lr=1e-3
+    )
+
     net.train()
+
+    # Setup for DDPM
+    sample_fn = (
+            diffusion.p_sample_loop
+    )
 
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
@@ -171,16 +219,44 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             if batch_idx >= batches_per_epoch:
                 break
 
-            xc = x.to(device)
+            img = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query)
+            pos_gt = yc[0]
 
+            if epoch>0:
+                alpha = 0.4
+            else:
+                alpha = 0.4*min(1,batch_idx/len(train_data))
+            idx = torch.zeros(img.shape[0]).to(device)
+            t, weights = schedule_sampler.sample(img.shape[0], device)
+
+            # Calculate loss
+            compute_losses = functools.partial(
+                diffusion.training_losses,
+                net,
+                pos_gt,
+                img,
+                t,  # [bs](int) sampled timesteps
+                query,
+                alpha,
+                idx,
+            )
+            losses = compute_losses()
+            loss = (losses["loss"] * weights).mean()
+
+            pos_output, cos_output, sin_output, width_output = net.pos_output_str, net.cos_output_str, net.sin_output_str, net.width_output_str
+
+            # Backward loss
+            # mp_trainer.backward(loss)
+            # mp_trainer.optimize(optimizer)
+
+            lossd = net.compute_loss(yc, pos_output, cos_output, sin_output, width_output)
             loss = lossd['loss']
 
             if batch_idx % 100 == 0:
-                logging.info('Epoch: {}, Batch: {}, Loss: {:0.4f}'.format(epoch, batch_idx, loss.item()))
+                logging.info('Epoch: {}, Batch: {}, Loss: {:0.4f}'.format(epoch, batch_idx, loss.mean().item()))
 
-            results['loss'] += loss.item()
+            results['loss'] += loss
             for ln, l in lossd['losses'].items():
                 if ln not in results['losses']:
                     results['losses'][ln] = 0
@@ -190,19 +266,24 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
             loss.backward()
             optimizer.step()
 
-            # Display the images
-            if vis:
-                imgs = []
-                n_img = min(4, x.shape[0])
-                for idx in range(n_img):
-                    imgs.extend([x[idx,].numpy().squeeze()] + [yi[idx,].numpy().squeeze() for yi in y] + [
-                        x[idx,].numpy().squeeze()] + [pc[idx,].detach().cpu().numpy().squeeze() for pc in
-                                                      lossd['pred'].values()])
-                gridshow('Display', imgs,
-                         [(xc.min().item(), xc.max().item()), (0.0, 1.0), (0.0, 1.0), (-1.0, 1.0),
-                          (0.0, 1.0)] * 2 * n_img,
-                         [cv2.COLORMAP_BONE] * 10 * n_img, 10)
-                cv2.waitKey(2)
+            if batch_idx % eval_every_n_steps == 0:
+                test_results = validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold)
+                logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+                                    test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+
+                # Log validation results to tensorbaord
+                tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), batch_idx)
+                tb.add_scalar('loss/val_loss', test_results['loss'], batch_idx)
+                for n, l in test_results['losses'].items():
+                    tb.add_scalar('val_loss/' + n, l, batch_idx)
+
+                # Save best performing network
+                iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+                if iou > best_iou:
+                    torch.save(net, os.path.join(save_folder, 'epoch_%02d_step_%06d_iou_%0.2f' % (epoch, batch_idx, iou)))
+                    best_iou = iou
+
+                net.train()
 
     results['loss'] /= batch_idx
     for l in results['losses']:
@@ -213,6 +294,7 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
 
 def run():
     args = parse_args()
+    eval_every_n_steps = args.eval_every_n_steps
 
     # Set-up output directories
     dt = datetime.datetime.now().strftime('%y%m%d_%H%M')
@@ -294,6 +376,8 @@ def run():
     logging.info('Loading Network...')
     input_channels = 1 * args.use_depth + 3 * args.use_rgb
     network = get_network(args.network)
+    diffusion = create_diffusion()
+    schedule_sampler = create_named_schedule_sampler('uniform', diffusion)
     net = network(
         input_channels=input_channels,
         dropout=args.use_dropout,
@@ -301,6 +385,9 @@ def run():
         channel_size=args.channel_size
     )
 
+    if args.resume:
+        net = torch.load(args.checkpoint_path)
+        
     net = net.to(device)
     logging.info('Done')
 
@@ -322,30 +409,31 @@ def run():
     best_iou = 0.0
     for epoch in range(args.epochs):
         logging.info('Beginning Epoch {:02d}'.format(epoch))
-        train_results = train(epoch, net, device, train_data, optimizer, args.batches_per_epoch, vis=args.vis)
+        train_results, best_iou = train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer, args.batches_per_epoch, val_data, args.iou_threshold, tb, save_folder, best_iou, vis=args.vis, eval_every_n_steps=eval_every_n_steps)
 
-        # Log training losses to tensorboard
-        tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
-        for n, l in train_results['losses'].items():
-            tb.add_scalar('train_loss/' + n, l, epoch)
+        # # Log training losses to tensorboard
+        # tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
+        # for n, l in train_results['losses'].items():
+        #     tb.add_scalar('train_loss/' + n, l, epoch)
 
-        # Run Validation
-        logging.info('Validating...')
-        test_results = validate(net, device, val_data, args.iou_threshold)
-        logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-                                     test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+        # if epoch > 0 and epoch % 100 == 0:
+        #     # Run Validation
+        #     logging.info('Validating...')
+        #     test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
+        #     logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+        #                                 test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
-        # Log validation results to tensorbaord
-        tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
-        tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
-        for n, l in test_results['losses'].items():
-            tb.add_scalar('val_loss/' + n, l, epoch)
+        #     # Log validation results to tensorbaord
+        #     tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
+        #     tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
+        #     for n, l in test_results['losses'].items():
+        #         tb.add_scalar('val_loss/' + n, l, epoch)
 
-        # Save best performing network
-        iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-        if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
-            torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
-            best_iou = iou
+        #     # Save best performing network
+        #     iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+        #     if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+        #         torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
+        #         best_iou = iou
 
 
 if __name__ == '__main__':

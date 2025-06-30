@@ -82,8 +82,11 @@ def parse_args():
                         help='Data split: train, test_seen, test_unseen') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
-    parser.add_argument('--eval-every-n-steps', type=int, default=5000)
+    parser.add_argument('--eval-every-n-steps', type=int, default=1000)
     
+    parser.add_argument('--resume', type=bool, default=False)
+    parser.add_argument('--checkpoint_path', type=str, default="")
+
     args = parser.parse_args()
     return args
 
@@ -111,10 +114,10 @@ def validate(net, device, val_data, iou_threshold):
     ld = len(val_data)
 
     with torch.no_grad():
-        for x, y, data_idx, rot, zoom_factor, prompt, query, _, _, _ in val_data:
+        for x, y, data_idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask in val_data:
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query)
+            lossd = net.compute_loss(xc, yc, prompt, query, bboxes, bbox_positions)
 
             loss = lossd['loss']
 
@@ -143,7 +146,7 @@ def validate(net, device, val_data, iou_threshold):
     return results
 
 
-def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=False):
+def train(epoch, net, device, train_data, optimizer, batches_per_epoch, val_data, iou_threshold, tb, save_folder, best_iou, vis=False, eval_every_n_steps=5000):
     """
     Run one training epoch
     :param epoch: Current epoch
@@ -166,14 +169,14 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
-        for x, y, _, _, _, prompt, query, _, _, _ in train_data:
+        for x, y, idx, _, _, prompt, query, bboxes, bbox_positions, bbox_mask in train_data:
             batch_idx += 1
             if batch_idx >= batches_per_epoch:
                 break
 
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query)
+            lossd = net.compute_loss(xc, yc, prompt, query, bboxes, bbox_positions)
 
             loss = lossd['loss']
 
@@ -204,15 +207,35 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
                          [cv2.COLORMAP_BONE] * 10 * n_img, 10)
                 cv2.waitKey(2)
 
+            if batch_idx % eval_every_n_steps == 0:
+                test_results = validate(net, device, val_data, iou_threshold)
+                logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+                                    test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+
+                # Log validation results to tensorbaord
+                tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), batch_idx)
+                tb.add_scalar('loss/val_loss', test_results['loss'], batch_idx)
+                for n, l in test_results['losses'].items():
+                    tb.add_scalar('val_loss/' + n, l, batch_idx)
+
+                # Save best performing network
+                iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+                if iou > best_iou:
+                    torch.save(net, os.path.join(save_folder, 'epoch_%02d_step_%06d_iou_%0.2f' % (epoch, batch_idx, iou)))
+                    best_iou = iou
+
+                net.train()
+
     results['loss'] /= batch_idx
     for l in results['losses']:
         results['losses'][l] /= batch_idx
 
-    return results
+    return results, best_iou
 
 
 def run():
     args = parse_args()
+    eval_every_n_steps = args.eval_every_n_steps
 
     # Set-up output directories
     dt = datetime.datetime.now().strftime('%y%m%d_%H%M')
@@ -254,12 +277,13 @@ def run():
     dataset = Dataset(args.dataset_path,
                       output_size=args.input_size,
                       ds_rotate=args.ds_rotate,
-                      random_rotate=False,
+                      random_rotate=False,  # disable rotation and zoom
                       random_zoom=False,
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
                       split=args.split,
-                      add_file_path=args.add_file_path)
+                      add_file_path=args.add_file_path,
+                      requires_bbox=True)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits
@@ -301,6 +325,9 @@ def run():
         channel_size=args.channel_size
     )
 
+    if args.resume:
+        net = torch.load(args.checkpoint_path)
+
     net = net.to(device)
     logging.info('Done')
 
@@ -322,30 +349,29 @@ def run():
     best_iou = 0.0
     for epoch in range(args.epochs):
         logging.info('Beginning Epoch {:02d}'.format(epoch))
-        train_results = train(epoch, net, device, train_data, optimizer, args.batches_per_epoch, vis=args.vis)
+        train_results, best_iou = train(epoch, net, device, train_data, optimizer, args.batches_per_epoch, val_data, args.iou_threshold, tb, save_folder, best_iou, vis=args.vis, eval_every_n_steps=eval_every_n_steps)
+        # # Log training losses to tensorboard
+        # tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
+        # for n, l in train_results['losses'].items():
+        #     tb.add_scalar('train_loss/' + n, l, epoch)
 
-        # Log training losses to tensorboard
-        tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
-        for n, l in train_results['losses'].items():
-            tb.add_scalar('train_loss/' + n, l, epoch)
+        # # Run Validation
+        # logging.info('Validating...')
+        # test_results = validate(net, device, val_data, args.iou_threshold)
+        # logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+        #                              test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
-        # Run Validation
-        logging.info('Validating...')
-        test_results = validate(net, device, val_data, args.iou_threshold)
-        logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-                                     test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+        # # Log validation results to tensorbaord
+        # tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
+        # tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
+        # for n, l in test_results['losses'].items():
+        #     tb.add_scalar('val_loss/' + n, l, epoch)
 
-        # Log validation results to tensorbaord
-        tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
-        tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
-        for n, l in test_results['losses'].items():
-            tb.add_scalar('val_loss/' + n, l, epoch)
-
-        # Save best performing network
-        iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-        if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
-            torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
-            best_iou = iou
+        # # Save best performing network
+        # iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+        # if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+        #     torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
+        #     best_iou = iou
 
 
 if __name__ == '__main__':

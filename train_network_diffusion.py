@@ -53,7 +53,7 @@ def parse_args():
                         help='Dataset Name ("cornell" or "jaquard")')
     parser.add_argument('--dataset-path', type=str,
                         help='Path to dataset')
-    parser.add_argument('--split', type=float, default=0.9,
+    parser.add_argument('--train-ratio', type=float, default=0.9,
                         help='Fraction of data for training (remainder is validation)')
     parser.add_argument('--ds-shuffle', action='store_true', default=False,
                         help='Shuffle the dataset')
@@ -71,6 +71,7 @@ def parse_args():
                         help='Batches per Epoch')
     parser.add_argument('--optim', type=str, default='adam',
                         help='Optmizer for the training. (adam or SGD)')
+    parser.add_argument('--lr', type=float, default=1e-3)
 
     # Logging etc.
     parser.add_argument('--description', type=str, default='',
@@ -83,8 +84,8 @@ def parse_args():
                         help='Force code to run in CPU mode')
     parser.add_argument('--random-seed', type=int, default=123,
                         help='Random seed for numpy')
-    parser.add_argument('--seen', type=int, default=1,
-                        help='Flag for using seen classes, only work for Grasp-Anything dataset') 
+    parser.add_argument('--split', type=str, default="train",
+                        help='Data split: train, test_seen, test_unseen') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
     
@@ -119,7 +120,7 @@ def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
     ld = len(val_data)
 
     with torch.no_grad():
-        for x, y, didx, rot, zoom_factor, prompt, query in val_data:
+        for x, y, data_idx, rot, zoom_factor, prompt, query, _, _, _ in val_data:
             img = x.to(device)
             yc = [yy.to(device) for yy in y]
             pos_gt = yc[0]
@@ -154,7 +155,7 @@ def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
 
             s = evaluation.calculate_iou_match(q_out,
                                                ang_out,
-                                               val_data.dataset.get_gtbb(didx, rot, zoom_factor),
+                                               val_data.dataset.get_gtbb(data_idx, rot, zoom_factor),
                                                no_grasps=1,
                                                grasp_width=w_out,
                                                threshold=iou_threshold
@@ -207,7 +208,7 @@ def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
-        for x, y, _, _, _, prompt, query in train_data:
+        for x, y, _, _, _, prompt, query, _, _, _ in train_data:
             batch_idx += 1
             if batch_idx >= batches_per_epoch:
                 break
@@ -274,8 +275,7 @@ def run():
     net_desc = '{}_{}'.format(dt, '_'.join(args.description.split()))
 
     save_folder = os.path.join(args.logdir, net_desc)
-    if not os.path.exists(save_folder):
-        os.makedirs(save_folder)
+    os.makedirs(save_folder, exist_ok=True)
     tb = tensorboardX.SummaryWriter(save_folder)
 
     # Save commandline args
@@ -314,13 +314,13 @@ def run():
                       random_zoom=True,
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
-                      seen=args.seen,
+                      split=args.split,
                       add_file_path=args.add_file_path)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits
     indices = list(range(dataset.length))
-    split = int(np.floor(args.split * dataset.length))
+    split = int(np.floor(args.train_ratio * dataset.length))
     if args.ds_shuffle:
         np.random.seed(args.random_seed)
         np.random.shuffle(indices)
@@ -363,9 +363,9 @@ def run():
     logging.info('Done')
 
     if args.optim.lower() == 'adam':
-        optimizer = optim.Adam(net.parameters())
+        optimizer = optim.Adam(net.parameters(), lr=args.lr)
     elif args.optim.lower() == 'sgd':
-        optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+        optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9)
     else:
         raise NotImplementedError('Optimizer {} is not implemented'.format(args.optim))
 
@@ -387,23 +387,24 @@ def run():
         for n, l in train_results['losses'].items():
             tb.add_scalar('train_loss/' + n, l, epoch)
 
-        # Run Validation
-        logging.info('Validating...')
-        test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
-        logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-                                     test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+        if epoch > 0 and epoch % 100 == 0:
+            # Run Validation
+            logging.info('Validating...')
+            test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
+            logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
+                                        test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
-        # Log validation results to tensorbaord
-        tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
-        tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
-        for n, l in test_results['losses'].items():
-            tb.add_scalar('val_loss/' + n, l, epoch)
+            # Log validation results to tensorbaord
+            tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
+            tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
+            for n, l in test_results['losses'].items():
+                tb.add_scalar('val_loss/' + n, l, epoch)
 
-        # Save best performing network
-        iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-        if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
-            torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
-            best_iou = iou
+            # Save best performing network
+            iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+            if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+                torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
+                best_iou = iou
 
 
 if __name__ == '__main__':

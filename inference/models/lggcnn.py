@@ -60,7 +60,7 @@ class LGGCNN(LanguageGraspModel):
         y_feats = y_feats.unsqueeze(2).expand(-1, -1, 19).unsqueeze(1).expand(-1, 8, -1, -1)
 
         # Combine textual features with the visual features
-        x = torch.clone(x).detach() + y_feats
+        x = x + y_feats
 
         x = F.relu(self.convt1(x))
         x = F.relu(self.convt2(x))

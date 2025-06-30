@@ -56,5 +56,12 @@ def gridshow(name, imgs, scales, cmaps, width, border=10):
 
     maxw = max([c.shape[1] for c in imgrows])
 
-    cv2.imshow(name, np.vstack(
+    # cv2.imshow(name, np.vstack(
+    #     [np.pad(r, ((border // 2, border // 2), (0, maxw - r.shape[1]), (0, 0)), mode='constant') for r in imgrows]))
+    
+    import time
+    import os
+    t = time.time()
+    os.makedirs("vis", exist_ok=True)
+    cv2.imwrite(f"vis/{t}.jpg", np.vstack(
         [np.pad(r, ((border // 2, border // 2), (0, maxw - r.shape[1]), (0, 0)), mode='constant') for r in imgrows]))

@@ -11,7 +11,7 @@ class LanguageGraspDatasetBase(torch.utils.data.Dataset):
     """
 
     def __init__(self, output_size=224, include_depth=True, include_rgb=False, random_rotate=False,
-                 random_zoom=False, input_only=False, seen=True, add_file_path=None):
+                 random_zoom=False, input_only=False, split="train", add_file_path=None):
         """
         :param output_size: Image output size in pixels (square)
         :param include_depth: Whether depth image is included

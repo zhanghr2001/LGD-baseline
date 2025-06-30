@@ -1,0 +1,30 @@
+pip install opencv-python-headless numpy==1.23.5 ruamel.yaml==0.17.21
+pip install --upgrade huggingface-hub
+
+
+预训练resnet权重
+'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth'
+并转换层命名
+
+预训练ragt权重
+https://github.com/kmittle/Grasp-Detection-NBMOD?tab=readme-ov-file#download-nbmod-and-model-weights
+得到 LGD/weights/RAGT-3-3.pth
+
+clipfusion中clip必须为fp32，否则会产生nan
+
+
+huggingface-cli login
+export HF_ENDPOINT=https://hf-mirror.com --token <token>
+huggingface-cli download google-bert/bert-base-uncased --local-dir /baishuanghao/LGD/weights/bert-base-uncased
+
+gg-cnn
+https://github.com/dougsm/ggcnn
+
+gr-cnn
+https://github.com/skumra/robotic-grasping
+
+det_seg
+https://github.com/stefan-ainetter/grasp_det_seg_cnn
+
+clipfusion
+https://github.com/xukechun/Vision-Language-Grasping

@@ -80,7 +80,7 @@ class GenerativeResnet(LanguageGraspModel):
         y_feats = y_feats.unsqueeze(2).expand(-1, -1, 56).unsqueeze(1).expand(-1, 128, -1, -1)
          
         # Combine textual features with the visual features
-        x = torch.clone(x).detach() + y_feats
+        x = x + y_feats
         
         x = F.relu(self.bn4(self.conv4(x)))
         x = F.relu(self.bn5(self.conv5(x)))

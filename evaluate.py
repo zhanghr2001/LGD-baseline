@@ -34,7 +34,7 @@ def parse_args():
                         help='Use RGB image for evaluation (1/0)')
     parser.add_argument('--augment', action='store_true',
                         help='Whether data augmentation should be applied')
-    parser.add_argument('--split', type=float, default=0.01,
+    parser.add_argument('--train-ratio', type=float, default=0.01,
                         help='Fraction of data for training (remainder is validation)')
     parser.add_argument('--ds-shuffle', action='store_true', default=False,
                         help='Shuffle the dataset')
@@ -60,8 +60,8 @@ def parse_args():
                         help='Force code to run in CPU mode')
     parser.add_argument('--random-seed', type=int, default=123,
                         help='Random seed for numpy')
-    parser.add_argument('--seen', type=int, default=1,
-                        help='Flag for using seen classes, only work for Grasp-Anything dataset') 
+    parser.add_argument('--split', type=str, default="train",
+                        help='Data split: train, test_seen, test_unseen') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
     
@@ -87,15 +87,15 @@ if __name__ == '__main__':
     test_dataset = Dataset(args.dataset_path,
                            output_size=args.input_size,
                            ds_rotate=args.ds_rotate,
-                           random_rotate=args.augment,
-                           random_zoom=args.augment,
+                           random_rotate=False,
+                           random_zoom=False,
                            include_depth=args.use_depth,
                            include_rgb=args.use_rgb,
-                           seen=args.seen,
+                           split=args.split,
                            add_file_path=args.add_file_path)
 
     indices = list(range(test_dataset.length))
-    split = int(np.floor(args.split * test_dataset.length))
+    split = int(np.floor(args.train_ratio * test_dataset.length))
     if args.ds_shuffle:
         np.random.seed(args.random_seed)
         np.random.shuffle(indices)
@@ -127,7 +127,7 @@ if __name__ == '__main__':
         start_time = time.time()
 
         with torch.no_grad():
-            for idx, (x, y, didx, rot, zoom, prompt, query) in enumerate(test_data):
+            for idx, (x, y, didx, rot, zoom, prompt, query, bboxes, bbox_positions, bbox_mask) in enumerate(test_data):
                 xc = x.to(device)
                 yc = [yi.to(device) for yi in y]
                 lossd = net.compute_loss(xc, yc, prompt, query)

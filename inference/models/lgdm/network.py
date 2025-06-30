@@ -53,6 +53,34 @@ class LGDM(LanguageGraspModel):
                 nn.init.xavier_uniform_(m.weight, gain=1)
         self._init_albef()
 
+    # def _init_albef(self):
+    #     import argparse
+
+    #     class WrapperArgument:
+    #         def __init__(self):
+    #             pass
+
+    #         def add_attribute(self, name, value):
+    #             setattr(self, name, value)
+
+    #     args = WrapperArgument()
+    #     args.config = 'inference/models/lgdm/albef/configs/Grounding.yaml'
+    #     args.gradcam_mode = 'itm'
+    #     args.block_num = 8
+    #     args.text_encoder = 'bert-base-uncased'
+    #     args.device = 'cuda'
+    #     args.world_size = 1
+    #     args.dist_url = 'env://'
+    #     args.distributed = True
+
+    #     utils.init_distributed_mode(args)
+
+    #     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    #     self.tokenizer = BertTokenizer.from_pretrained("weights/bert-base-uncased")
+
+    #     self.albef = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=self.tokenizer)
+
+
     def _init_albef(self):
         import argparse
 
@@ -65,18 +93,18 @@ class LGDM(LanguageGraspModel):
 
         args = WrapperArgument()
         args.config = 'inference/models/lgdm/albef/configs/Grounding.yaml'
-        args.gradcam_mode = 'itm'
-        args.block_num = 8
+        # args.gradcam_mode = 'itm'
+        # args.block_num = 8
         args.text_encoder = 'bert-base-uncased'
-        args.device = 'cuda'
-        args.world_size = 1
-        args.dist_url = 'env://'
-        args.distributed = True
+        # args.device = 'cuda'
+        # args.world_size = 1
+        # args.dist_url = 'env://'
+        # args.distributed = True
 
-        utils.init_distributed_mode(args)
+        # utils.init_distributed_mode(args)
 
         config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
-        self.tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+        self.tokenizer = BertTokenizer.from_pretrained("weights/bert-base-uncased")
 
         self.albef = ALBEF(config=config, text_encoder=args.text_encoder, tokenizer=self.tokenizer)
 
@@ -170,6 +198,80 @@ class LGDM(LanguageGraspModel):
                 'width': width_pred
             }
         }
+
+    # def compute_loss_valid(self, yc, pos_pred, cos_pred, sin_pred, width_pred):
+    #     y_pos, y_cos, y_sin, y_width = yc[0], yc[1], yc[2], yc[3]
+
+    #     # if sample is None:
+    #     #     pos_pred, cos_pred, sin_pred, width_pred = self.pos_output_str, self.cos_output_str, self.sin_output_str, self.width_output_str
+    #     # else:
+    #     #     pos_pred = sample
+    #     #     cos_pred, sin_pred, width_pred = self.cos_output_str, self.sin_output_str, self.width_output_str
+
+    #     p_loss = F.mse_loss(pos_pred, y_pos)
+    #     cos_loss = F.mse_loss(cos_pred, y_cos)
+    #     sin_loss = F.mse_loss(sin_pred, y_sin)
+    #     width_loss = F.mse_loss(width_pred, y_width)
+
+    #     # Get contrastive loss
+    #     # contr_loss = self._get_contrastive_loss(self.full_image_atts.to(y_pos.device), y_pos)
+
+    #     return {
+    #         'loss': p_loss + cos_loss + sin_loss + width_loss,
+    #         'losses': {
+    #             'p_loss': p_loss,
+    #             'cos_loss': cos_loss,
+    #             'sin_loss': sin_loss,
+    #             'width_loss': width_loss,
+    #             # 'contr_loss': contr_loss,
+    #         },
+    #         'pred': {
+    #             'pos': pos_pred,
+    #             'cos': cos_pred,
+    #             'sin': sin_pred,
+    #             'width': width_pred
+    #         }
+    #     }
+
+    # def compute_loss_train(self, diffusion, pos_gt, img, t, weights, query, alpha, idx, yc):
+    #     losses = diffusion.training_losses(self, pos_gt, img, t, query, alpha, idx)
+
+    #     # loss = (losses["loss"] * weights).mean()
+
+    #     pos_pred, cos_pred, sin_pred, width_pred = self.pos_output_str, self.cos_output_str, self.sin_output_str, self.width_output_str
+
+    #     y_pos, y_cos, y_sin, y_width = yc[0], yc[1], yc[2], yc[3]
+
+    #     # if sample is None:
+    #     #     pos_pred, cos_pred, sin_pred, width_pred = self.pos_output_str, self.cos_output_str, self.sin_output_str, self.width_output_str
+    #     # else:
+    #     #     pos_pred = sample
+    #     #     cos_pred, sin_pred, width_pred = self.cos_output_str, self.sin_output_str, self.width_output_str
+
+    #     p_loss = F.mse_loss(pos_pred, y_pos)
+    #     cos_loss = F.mse_loss(cos_pred, y_cos)
+    #     sin_loss = F.mse_loss(sin_pred, y_sin)
+    #     width_loss = F.mse_loss(width_pred, y_width)
+
+    #     # Get contrastive loss
+    #     # contr_loss = self._get_contrastive_loss(self.full_image_atts.to(y_pos.device), y_pos)
+
+    #     return {
+    #         'loss': p_loss + cos_loss + sin_loss + width_loss,
+    #         'losses': {
+    #             'p_loss': p_loss,
+    #             'cos_loss': cos_loss,
+    #             'sin_loss': sin_loss,
+    #             'width_loss': width_loss,
+    #             # 'contr_loss': contr_loss,
+    #         },
+    #         'pred': {
+    #             'pos': pos_pred,
+    #             'cos': cos_pred,
+    #             'sin': sin_pred,
+    #             'width': width_pred
+    #         }
+    #     }
     
     def _get_contrastive_loss(self, x, y, temperature=1.0):
         # Normalize the vectors along the channel dimension
