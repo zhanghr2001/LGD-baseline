@@ -4,14 +4,26 @@ import json
 import logging
 import os
 import sys
+import functools
 
 import cv2
 import numpy as np
 import tensorboardX
+
 import torch
 import torch.optim as optim
 import torch.utils.data
+from torch.utils.data import random_split, Subset
+from torch.optim import AdamW
 from torchsummary import summary
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.multiprocessing as mp
+
+from diffusion.resample import create_named_schedule_sampler
+from diffusion.fp16_util import MixedPrecisionTrainer
 
 from hardware.device import get_device
 from inference.models import get_network
@@ -19,13 +31,14 @@ from inference.post_process import post_process_output
 from utils.data import get_dataset
 from utils.dataset_processing import evaluation
 from utils.visualisation.gridshow import gridshow
+from utils.model_util import create_diffusion
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train network')
 
     # Network
-    parser.add_argument('--network', type=str, default='lgrconvnet3',
+    parser.add_argument('--network', type=str, default='lgdm',
                         help='Network name in inference/models')
     parser.add_argument('--input-size', type=int, default=224,
                         help='Input image size for the network')
@@ -78,20 +91,16 @@ def parse_args():
                         help='Force code to run in CPU mode')
     parser.add_argument('--random-seed', type=int, default=123,
                         help='Random seed for numpy')
-    parser.add_argument('--split', type=str, default="train",
+    parser.add_argument('--train-ratio', type=str, default="train",
                         help='Data split: train, test_seen, test_unseen') 
     parser.add_argument('--add-file-path', type=str, default='data/grasp-anywhere',
                         help='Specific for Grasp-Anywhere')
-    parser.add_argument('--eval-every-n-steps', type=int, default=1000)
     
-    parser.add_argument('--resume', type=bool, default=False)
-    parser.add_argument('--checkpoint-path', type=str, default="")
-
     args = parser.parse_args()
     return args
 
 
-def validate(net, device, val_data, iou_threshold):
+def validate(net, diffusion, schedule_sampler, device, val_data, iou_threshold):
     """
     Run validation.
     :param net: Network
@@ -102,23 +111,42 @@ def validate(net, device, val_data, iou_threshold):
     """
     net.eval()
 
+    sample_fn = (
+            diffusion.p_sample_loop
+    )
+
     results = {
         'correct': 0,
         'failed': 0,
         'loss': 0,
-        'losses': {
-
-        }
+        'losses': {}
     }
 
     ld = len(val_data)
 
     with torch.no_grad():
-        for x, y, data_idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask in val_data:
-            xc = x.to(device)
+        for x, y, didx, rot, zoom_factor, prompt, query, _, _, _ in val_data:
+            img = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query, bboxes, bbox_positions)
+            pos_gt = yc[0]
 
+            alpha = 0.4
+            idx = torch.ones(img.shape[0]).to(device)
+
+            sample = sample_fn(
+                net,
+                pos_gt.shape,
+                pos_gt,
+                img,
+                query,
+                alpha,
+                idx,
+            )
+
+            pos_output = sample
+            cos_output, sin_output, width_output = net.module.cos_output_str, net.module.sin_output_str, net.module.width_output_str
+
+            lossd = net.module.compute_loss_valid(yc, pos_output, cos_output, sin_output, width_output)
             loss = lossd['loss']
 
             results['loss'] += loss.item() / ld
@@ -132,7 +160,7 @@ def validate(net, device, val_data, iou_threshold):
 
             s = evaluation.calculate_iou_match(q_out,
                                                ang_out,
-                                               val_data.dataset.get_gtbb(data_idx, rot, zoom_factor),
+                                               val_data.dataset.get_gtbb(didx, rot, zoom_factor),
                                                no_grasps=1,
                                                grasp_width=w_out,
                                                threshold=iou_threshold
@@ -146,7 +174,7 @@ def validate(net, device, val_data, iou_threshold):
     return results
 
 
-def train(epoch, net, device, train_data, optimizer, batches_per_epoch, val_data, iou_threshold, tb, save_folder, best_iou, vis=False, eval_every_n_steps=5000):
+def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer, batches_per_epoch, vis=False):
     """
     Run one training epoch
     :param epoch: Current epoch
@@ -164,26 +192,70 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, val_data
         }
     }
 
+    use_fp16 = False
+    fp16_scale_growth = 1e-3
+    mp_trainer = MixedPrecisionTrainer(
+            model=net,
+            use_fp16=use_fp16,
+            fp16_scale_growth=fp16_scale_growth,
+    )
+    optimizer = AdamW(
+        mp_trainer.master_params, lr=1e-3
+    )
+
     net.train()
+
+    # Setup for DDPM
+    sample_fn = (
+            diffusion.p_sample_loop
+    )
 
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
-        for x, y, idx, _, _, prompt, query, bboxes, bbox_positions, bbox_mask in train_data:
+        for x, y, _, _, _, prompt, query, _, _, _ in train_data:
             batch_idx += 1
             if batch_idx >= batches_per_epoch:
                 break
 
-            xc = x.to(device)
+            img = x.to(device)
             yc = [yy.to(device) for yy in y]
-            lossd = net.compute_loss(xc, yc, prompt, query, bboxes, bbox_positions)
+            pos_gt = yc[0]
 
+            if epoch>0:
+                alpha = 0.4
+            else:
+                alpha = 0.4*min(1,batch_idx/len(train_data))
+            idx = torch.zeros(img.shape[0]).to(device)
+            t, weights = schedule_sampler.sample(img.shape[0], device)
+
+            # Calculate loss
+            # compute_losses = functools.partial(
+            #     diffusion.training_losses,
+            #     net,
+            #     pos_gt,
+            #     img,
+            #     t,  # [bs](int) sampled timesteps
+            #     query,
+            #     alpha,
+            #     idx,
+            # )
+            # losses = compute_losses()
+            # loss = (losses["loss"] * weights).mean()
+
+            # pos_output, cos_output, sin_output, width_output = net.module.pos_output_str, net.module.cos_output_str, net.module.sin_output_str, net.module.width_output_str
+
+            # Backward loss
+            # mp_trainer.backward(loss)
+            # mp_trainer.optimize(optimizer)
+
+            lossd = net.module.compute_loss_train(diffusion, pos_gt, img, t, weights, query, alpha, idx, yc)
             loss = lossd['loss']
 
             if batch_idx % 100 == 0:
-                logging.info('Epoch: {}, Batch: {}, Loss: {:0.4f}'.format(epoch, batch_idx, loss.item()))
+                logging.info('Epoch: {}, Batch: {}, Loss: {:0.4f}'.format(epoch, batch_idx, loss.mean().item()))
 
-            results['loss'] += loss.item()
+            results['loss'] += loss
             for ln, l in lossd['losses'].items():
                 if ln not in results['losses']:
                     results['losses'][ln] = 0
@@ -193,72 +265,44 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, val_data
             loss.backward()
             optimizer.step()
 
-            # Display the images
-            if vis:
-                imgs = []
-                n_img = min(4, x.shape[0])
-                for idx in range(n_img):
-                    imgs.extend([x[idx,].numpy().squeeze()] + [yi[idx,].numpy().squeeze() for yi in y] + [
-                        x[idx,].numpy().squeeze()] + [pc[idx,].detach().cpu().numpy().squeeze() for pc in
-                                                      lossd['pred'].values()])
-                gridshow('Display', imgs,
-                         [(xc.min().item(), xc.max().item()), (0.0, 1.0), (0.0, 1.0), (-1.0, 1.0),
-                          (0.0, 1.0)] * 2 * n_img,
-                         [cv2.COLORMAP_BONE] * 10 * n_img, 10)
-                cv2.waitKey(2)
-
-            if batch_idx % eval_every_n_steps == 0:
-                test_results = validate(net, device, val_data, iou_threshold)
-                logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-                                    test_results['correct'] / (test_results['correct'] + test_results['failed'])))
-
-                # Log validation results to tensorbaord
-                tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), batch_idx)
-                tb.add_scalar('loss/val_loss', test_results['loss'], batch_idx)
-                for n, l in test_results['losses'].items():
-                    tb.add_scalar('val_loss/' + n, l, batch_idx)
-
-                # Save best performing network
-                iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-                if iou > best_iou:
-                    torch.save(net, os.path.join(save_folder, 'epoch_%02d_step_%06d_iou_%0.2f' % (epoch, batch_idx, iou)))
-                    best_iou = iou
-
-                net.train()
-
     results['loss'] /= batch_idx
     for l in results['losses']:
         results['losses'][l] /= batch_idx
 
-    return results, best_iou
+    return results
 
 
-def run():
-    args = parse_args()
-    eval_every_n_steps = args.eval_every_n_steps
-
+def run(args):
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    
     # Set-up output directories
     dt = datetime.datetime.now().strftime('%y%m%d_%H%M')
     net_desc = '{}_{}'.format(dt, '_'.join(args.description.split()))
 
-    save_folder = os.path.join(args.logdir, net_desc)
-    os.makedirs(save_folder, exist_ok=True)
-    tb = tensorboardX.SummaryWriter(save_folder)
+    if rank == 0:
+        save_folder = os.path.join(args.logdir, net_desc)
+        os.makedirs(save_folder, exist_ok=True)
+        tb = tensorboardX.SummaryWriter(save_folder)
+        # Save commandline args
+        if args is not None:
+            params_path = os.path.join(save_folder, 'commandline_args.json')
+            with open(params_path, 'w') as f:
+                json.dump(vars(args), f)
 
-    # Save commandline args
-    if args is not None:
-        params_path = os.path.join(save_folder, 'commandline_args.json')
-        with open(params_path, 'w') as f:
-            json.dump(vars(args), f)
+        # Initialize logging
+        logging.root.handlers = []
+        logging.basicConfig(
+            level=logging.INFO,
+            filename="{0}/{1}.log".format(save_folder, 'log'),
+            format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+    else:
+        save_folder = None
 
-    # Initialize logging
-    logging.root.handlers = []
-    logging.basicConfig(
-        level=logging.INFO,
-        filename="{0}/{1}.log".format(save_folder, 'log'),
-        format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
     # set up logging to console
     console = logging.StreamHandler()
     console.setLevel(logging.DEBUG)
@@ -268,22 +312,18 @@ def run():
     # add the handler to the root logger
     logging.getLogger('').addHandler(console)
 
-    # Get the compute device
-    device = get_device(args.force_cpu)
-
     # Load Dataset
     logging.info('Loading {} Dataset...'.format(args.dataset.title()))
     Dataset = get_dataset(args.dataset)
     dataset = Dataset(args.dataset_path,
                       output_size=args.input_size,
                       ds_rotate=args.ds_rotate,
-                      random_rotate=False,  # disable rotation and zoom
-                      random_zoom=False,
+                      random_rotate=True,
+                      random_zoom=True,
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
                       split=args.split,
-                      add_file_path=args.add_file_path,
-                      requires_bbox=True)
+                      add_file_path=args.add_file_path)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits
@@ -293,22 +333,26 @@ def run():
         np.random.seed(args.random_seed)
         np.random.shuffle(indices)
     train_indices, val_indices = indices[:split], indices[split:]
+
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+
     logging.info('Training size: {}'.format(len(train_indices)))
     logging.info('Validation size: {}'.format(len(val_indices)))
 
     # Creating data samplers and loaders
-    train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_indices)
-    val_sampler = torch.utils.data.sampler.SubsetRandomSampler(val_indices)
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset)
 
     train_data = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         sampler=train_sampler
     )
     val_data = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=1,
+        val_dataset,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         sampler=val_sampler
     )
@@ -318,6 +362,8 @@ def run():
     logging.info('Loading Network...')
     input_channels = 1 * args.use_depth + 3 * args.use_rgb
     network = get_network(args.network)
+    diffusion = create_diffusion()
+    schedule_sampler = create_named_schedule_sampler('uniform', diffusion)
     net = network(
         input_channels=input_channels,
         dropout=args.use_dropout,
@@ -325,10 +371,8 @@ def run():
         channel_size=args.channel_size
     )
 
-    if args.resume:
-        net = torch.load(args.checkpoint_path)
-
     net = net.to(device)
+    net = DDP(net, device_ids=[device], find_unused_parameters=True)
     logging.info('Done')
 
     if args.optim.lower() == 'adam':
@@ -348,31 +392,49 @@ def run():
 
     best_iou = 0.0
     for epoch in range(args.epochs):
-        logging.info('Beginning Epoch {:02d}'.format(epoch))
-        train_results, best_iou = train(epoch, net, device, train_data, optimizer, args.batches_per_epoch, val_data, args.iou_threshold, tb, save_folder, best_iou, vis=args.vis, eval_every_n_steps=eval_every_n_steps)
-        # # Log training losses to tensorboard
-        # tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
-        # for n, l in train_results['losses'].items():
-        #     tb.add_scalar('train_loss/' + n, l, epoch)
+        if rank == 0:
+            logging.info('Beginning Epoch {:02d}'.format(epoch))
+            logging.info('time: {}'.format(datetime.datetime.now()))
 
-        # # Run Validation
-        # logging.info('Validating...')
-        # test_results = validate(net, device, val_data, args.iou_threshold)
+        train_results = train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer, args.batches_per_epoch, vis=args.vis)
+
+        if rank == 0:
+            # Log training losses to tensorboard
+            tb.add_scalar('loss/train_loss', train_results['loss'], epoch)
+            for n, l in train_results['losses'].items():
+                tb.add_scalar('train_loss/' + n, l, epoch)
+
+        # if rank == 0:
+        #     # Run Validation
+        #     logging.info('Validating...')
+        #     logging.info('time: {}'.format(datetime.datetime.now()))
+
+        # test_results = validate(net, diffusion, schedule_sampler, device, val_data, args.iou_threshold)
+
         # logging.info('%d/%d = %f' % (test_results['correct'], test_results['correct'] + test_results['failed'],
-        #                              test_results['correct'] / (test_results['correct'] + test_results['failed'])))
+        #                             test_results['correct'] / (test_results['correct'] + test_results['failed'])))
 
-        # # Log validation results to tensorbaord
-        # tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
-        # tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
-        # for n, l in test_results['losses'].items():
-        #     tb.add_scalar('val_loss/' + n, l, epoch)
+        # if rank == 0:
+        #     # Log validation results to tensorbaord
+        #     tb.add_scalar('loss/IOU', test_results['correct'] / (test_results['correct'] + test_results['failed']), epoch)
+        #     tb.add_scalar('loss/val_loss', test_results['loss'], epoch)
+        #     for n, l in test_results['losses'].items():
+        #         tb.add_scalar('val_loss/' + n, l, epoch)
 
-        # # Save best performing network
-        # iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
-        # if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
-        #     torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
-        #     best_iou = iou
+        #     # Save best performing network
+        #     iou = test_results['correct'] / (test_results['correct'] + test_results['failed'])
+        #     if iou > best_iou or epoch == 0 or (epoch % 10) == 0:
+        #         torch.save(net, os.path.join(save_folder, 'epoch_%02d_iou_%0.2f' % (epoch, iou)))
+        #         best_iou = iou
 
+        if rank == 0:
+            if epoch % 100 == 0:
+                torch.save(net, os.path.join(save_folder, 'epoch_%02d' % (epoch)))
+    
+    dist.destroy_process_group()
+
+    
 
 if __name__ == '__main__':
-    run()
+    args = parse_args()
+    run(args)

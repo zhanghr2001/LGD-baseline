@@ -9,7 +9,7 @@ python evaluate_diffusion.py \
     --split test_seen \
     --train-ratio 0.9 \
     --ds-shuffle \
-    --network logs/250619_1806_train_lgdm_grasp_anything_large_data/epoch_00_step_130000_iou_0.38
+    --network logs/250729_1522_train_lgdm_resume_e2/epoch_00_step_005000_iou_0.53
 
 python evaluate_diffusion.py \
     --dataset my-grasp-anything \
@@ -20,4 +20,4 @@ python evaluate_diffusion.py \
     --split test_unseen \
     --train-ratio 0.9 \
     --ds-shuffle \
-    --network logs/250619_1806_train_lgdm_grasp_anything_large_data/epoch_00_step_130000_iou_0.38
+    --network logs/250729_1522_train_lgdm_resume_e2/epoch_00_step_005000_iou_0.53

@@ -11,7 +11,7 @@ pattern="epoch_*"
 for file in "$folder_path"/$pattern; do
     if [ -f "$file" ]; then
         echo "Running command with file: $file"
-        python -m torch.distributed.launch --nproc_per_node=1 --use_env -m evaluate_diffusion --dataset grasp-anything --dataset-path data/grasp-anything/ --iou-eval --use-depth 0 --seen 0 --split 0.01 --network "$file"  # Execute the command with the file as a parameter
+        python -m torch.distributed.launch --nproc_per_node=1 --use_env -m evaluate_diffusion --dataset grasp-anything --dataset-path data/grasp-anything/ --iou-eval --use-depth 0 --seen 0 --train-ratio 0.01 --network "$file"  # Execute the command with the file as a parameter
     fi
 done
 

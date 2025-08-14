@@ -132,37 +132,37 @@ class ALBEF(nn.Module):
                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
                 
                 
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, image_feat, text_feat, idx):
-        # gather keys before updating queue
-        image_feats = concat_all_gather(image_feat)
-        text_feats = concat_all_gather(text_feat)
-        idxs = concat_all_gather(idx)
+#     @torch.no_grad()
+#     def _dequeue_and_enqueue(self, image_feat, text_feat, idx):
+#         # gather keys before updating queue
+#         image_feats = concat_all_gather(image_feat)
+#         text_feats = concat_all_gather(text_feat)
+#         idxs = concat_all_gather(idx)
 
-        batch_size = image_feats.shape[0]
+#         batch_size = image_feats.shape[0]
 
-        ptr = int(self.queue_ptr)
-        # assert self.queue_size % batch_size == 0  # for simplicity
+#         ptr = int(self.queue_ptr)
+#         # assert self.queue_size % batch_size == 0  # for simplicity
 
-        # replace the keys at ptr (dequeue and enqueue)
-        self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
-        self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
-        self.idx_queue[:, ptr:ptr + batch_size] = idxs.T
-        ptr = (ptr + batch_size) % self.queue_size  # move pointer
+#         # replace the keys at ptr (dequeue and enqueue)
+#         self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
+#         self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
+#         self.idx_queue[:, ptr:ptr + batch_size] = idxs.T
+#         ptr = (ptr + batch_size) % self.queue_size  # move pointer
 
-        self.queue_ptr[0] = ptr  
+#         self.queue_ptr[0] = ptr  
         
 
-@torch.no_grad()
-def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+# @torch.no_grad()
+# def concat_all_gather(tensor):
+#     """
+#     Performs all_gather operation on the provided tensors.
+#     *** Warning ***: torch.distributed.all_gather has no gradient.
+#     """
+#     tensors_gather = [torch.ones_like(tensor)
+#         for _ in range(torch.distributed.get_world_size())]
+#     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
-    output = torch.cat(tensors_gather, dim=0)
-    return output        
+#     output = torch.cat(tensors_gather, dim=0)
+#     return output        
 

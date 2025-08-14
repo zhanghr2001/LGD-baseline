@@ -4,8 +4,9 @@ python evaluate.py \
     --dataset my-grasp-anything \
     --dataset-path /baishuanghao/mllm_data/grasp_anything/ \
     --iou-eval \
+    --vis \
     --use-rgb 1 \
     --use-depth 0 \
-    --split test_unseen \
+    --split test_seen \
     --train-ratio 0 \
-    --network logs/250619_1626_train_lggcnn_grasp_anything_large_data/epoch_00_step_090000_iou_0.45
+    --network logs/250719_2003_train_lggcnn_match_data_16batch/epoch_02_step_006000_iou_0.55

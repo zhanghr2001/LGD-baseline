@@ -156,7 +156,7 @@ if __name__ == '__main__':
                 if args.vis:
                     save_results(
                         rgb_img=test_data.dataset.get_rgb(didx, rot, zoom, normalise=False),
-                        depth_img=test_data.dataset.get_depth(didx, rot, zoom),
+                        depth_img=None,
                         grasp_q_img=q_img,
                         grasp_angle_img=ang_img,
                         no_grasps=args.n_grasps,

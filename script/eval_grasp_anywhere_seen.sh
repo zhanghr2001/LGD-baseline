@@ -11,7 +11,7 @@ pattern="epoch_*"
 for file in "$folder_path"/$pattern; do
     if [ -f "$file" ]; then
         echo "Running command with file: $file"
-        python evaluate.py --dataset grasp-anywhere --dataset-path data/grasp-anything/ --add-file-path data/grasp-anywhere/seen --iou-eval --use-depth 0 --seen 1 --split 0.99 --network "$file"  # Execute the command with the file as a parameter
+        python evaluate.py --dataset grasp-anywhere --dataset-path data/grasp-anything/ --add-file-path data/grasp-anywhere/seen --iou-eval --use-depth 0 --seen 1 --train-ratio 0.99 --network "$file"  # Execute the command with the file as a parameter
     fi
 done
 

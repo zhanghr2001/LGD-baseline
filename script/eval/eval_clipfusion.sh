@@ -6,6 +6,6 @@ python evaluate_clipfusion.py \
     --iou-eval \
     --use-rgb 1 \
     --use-depth 0 \
-    --split test_seen \
+    --split test_unseen \
     --train-ratio 0 \
-    --network logs/250619_1740_train_clipfusion_grasp_anything_large_data/epoch_00_step_130000_iou_0.13
+    --network logs/250718_0316_train_clipfusion_grasp_anything_match_data2/epoch_00_step_022000_iou_0.41

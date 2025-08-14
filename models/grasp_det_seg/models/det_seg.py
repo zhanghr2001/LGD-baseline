@@ -96,7 +96,7 @@ class DetSegNet(GraspModel):
         # Pad the input images
         output_size = img.shape[-1]
         device = img.device
-        img.requires_grad_(True)
+        # img.requires_grad_(True)
         img, valid_size = pad_packed_images(img)
         img_size = img.shape[-2:]
 

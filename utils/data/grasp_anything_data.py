@@ -152,11 +152,12 @@ class MyGraspAnythingDataset(LanguageGraspDatasetBase):
         self.scene_description_dir = os.path.join(file_path, "scene_description")
         self.mask_dir = os.path.join(file_path, "mask")
 
-        split_dir = "split/grasp-anything-filter"
+        # split_dir = "split/grasp-anything-filter"
+        split_dir = "split/grasp-anything-match"
         if kwargs["split"] == "train":
-            TRAIN_SIZE = 1200000
+            # TRAIN_SIZE = 1200000
             self.data = pd.read_csv(os.path.join(split_dir, "train.csv"), names=["id", "obj_name", "scene_description"])
-            self.data = self.data.sample(n=TRAIN_SIZE, random_state=42)
+            # self.data = self.data.sample(n=TRAIN_SIZE, random_state=42)
         elif kwargs["split"] == "test_seen":
             self.data = pd.read_csv(os.path.join(split_dir, "test_seen.csv"), names=["id", "obj_name", "scene_description"])
         elif kwargs["split"] == "test_unseen":
@@ -300,6 +301,7 @@ class MyGraspAnythingDataset(LanguageGraspDatasetBase):
             rgb_img = self.get_rgb(idx, rot, zoom_factor)
 
         # Load the grasps
+        # GraspRectangles, angle 0 to -pi
         bbs = self.get_gtbb(idx, rot, zoom_factor)
 
         # Load the prompts
@@ -307,6 +309,8 @@ class MyGraspAnythingDataset(LanguageGraspDatasetBase):
 
         pos_img, ang_img, width_img = bbs.draw((self.output_size, self.output_size))
         width_img = np.clip(width_img, 0.0, self.output_size / 2) / (self.output_size / 2)
+        print("angle max: ", np.max(ang_img))
+        print("angle min:", np.min(ang_img))
 
         if self.include_depth and self.include_rgb:
             x = self.numpy_to_torch(

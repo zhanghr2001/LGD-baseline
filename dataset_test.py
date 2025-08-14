@@ -34,10 +34,27 @@ dataset = Dataset("/baishuanghao/mllm_data/grasp_anything",
                     add_file_path=None)
 logging.info('Dataset size is {}'.format(dataset.length))
 
-x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask = dataset[185861]
-print(x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask)
 
-# for i in tqdm(range(len(dataset))):
+# Dataset = get_dataset("my-real-data")
+# dataset = Dataset("/baishuanghao/mllm_data/grasp_anything",
+#                     output_size=224,
+#                     ds_rotate=0,
+#                     random_rotate=False,
+#                     random_zoom=False,
+#                     include_depth=0,
+#                     include_rgb=1,
+#                     split="train",
+#                     add_file_path=None)
+# logging.info('Dataset size is {}'.format(dataset.length))
+# print(set(dataset.obj_names))
+# x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask = dataset[0]
+
+# print(cos)
+# print(sin)
+# print(x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask)
+
+for i in tqdm(range(len(dataset))):
+    x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask = dataset[i]
 #     try:
 #         x, (pos, cos, sin, width), idx, rot, zoom_factor, prompt, query, bboxes, bbox_positions, bbox_mask = dataset[i]
 #     except ValueError:

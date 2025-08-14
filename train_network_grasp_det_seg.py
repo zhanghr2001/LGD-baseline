@@ -50,7 +50,7 @@ def parse_args():
                         help='Dataset Name ("cornell" or "jaquard")')
     parser.add_argument('--dataset-path', type=str,
                         help='Path to dataset')
-    parser.add_argument('--split', type=float, default=0.9,
+    parser.add_argument('--train-ratio', type=float, default=0.9,
                         help='Fraction of data for training (remainder is validation)')
     parser.add_argument('--ds-shuffle', action='store_true', default=False,
                         help='Shuffle the dataset')
@@ -80,8 +80,8 @@ def parse_args():
                         help='Force code to run in CPU mode')
     parser.add_argument('--random-seed', type=int, default=123,
                         help='Random seed for numpy')
-    parser.add_argument('--seen', type=int, default=1,
-                        help='Flag for using seen classes, only work for Grasp-Anything dataset') 
+    parser.add_argument('--train-ratio', type=str, default="train",
+                        help='Data split: train, test_seen, test_unseen') 
 
     args = parser.parse_args()
     return args
@@ -110,7 +110,7 @@ def validate(net, device, val_data, iou_threshold):
     ld = len(val_data)
 
     with torch.no_grad():
-        for x, y, didx, rot, zoom_factor in val_data:
+        for x, y, idx, rot, zoom_factor, _, _, _, _, _ in val_data:
             xc = x.to(device)
             yc = [yy.to(device) for yy in y]
             lossd = net.compute_loss(xc, yc)
@@ -128,7 +128,7 @@ def validate(net, device, val_data, iou_threshold):
 
             s = evaluation.calculate_iou_match(q_out,
                                                ang_out,
-                                               val_data.dataset.get_gtbb(didx, rot, zoom_factor),
+                                               val_data.dataset.get_gtbb(idx, rot, zoom_factor),
                                                no_grasps=1,
                                                grasp_width=w_out,
                                                threshold=iou_threshold
@@ -165,7 +165,7 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
     batch_idx = 0
     # Use batches per epoch to make training on different sized datasets (cornell/jacquard) more equivalent.
     while batch_idx <= batches_per_epoch:
-        for x, y, _, _, _ in train_data:
+        for x, y, _, _, _, _, _, _, _, _ in train_data:
             batch_idx += 1
             if batch_idx >= batches_per_epoch:
                 break
@@ -177,6 +177,7 @@ def train(epoch, net, device, train_data, optimizer, batches_per_epoch, vis=Fals
 
             if batch_idx % 100 == 0:
                 logging.info('Epoch: {}, Batch: {}, Loss: {:0.4f}'.format(epoch, batch_idx, loss.item()))
+                logging.info(f"time: {datetime.datetime.now().strftime('%y%m%d_%H%M')}")
 
             results['loss'] += loss.item()
             for ln, l in lossd['losses'].items():
@@ -220,8 +221,7 @@ def run():
     net_desc = '{}_{}'.format(dt, '_'.join(args.description.split()))
 
     save_folder = os.path.join(args.logdir, net_desc)
-    if not os.path.exists(save_folder):
-        os.makedirs(save_folder)
+    os.makedirs(save_folder, exist_ok=True)
     tb = tensorboardX.SummaryWriter(save_folder)
 
     # Save commandline args
@@ -260,12 +260,12 @@ def run():
                       random_zoom=True,
                       include_depth=args.use_depth,
                       include_rgb=args.use_rgb,
-                      seen=args.seen)
+                      split=args.split)
     logging.info('Dataset size is {}'.format(dataset.length))
 
     # Creating data indices for training and validation splits
     indices = list(range(dataset.length))
-    split = int(np.floor(args.split * dataset.length))
+    split = int(np.floor(args.train_ratio * dataset.length))
     if args.ds_shuffle:
         np.random.seed(args.random_seed)
         np.random.shuffle(indices)
@@ -299,8 +299,8 @@ def run():
 
     # Load the network
     logging.info('Loading Network...')
-    input_channels = 1 * args.use_depth + 3 * args.use_rgb
-    network = get_network(args.network)
+    # input_channels = 1 * args.use_depth + 3 * args.use_rgb
+    # network = get_network(args.network)
     # net = network(
     #     input_channels=input_channels,
     #     dropout=args.use_dropout,

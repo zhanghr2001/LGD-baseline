@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument('--eval-every-n-steps', type=int, default=1000)
 
     parser.add_argument('--resume', type=bool, default=False)
-    parser.add_argument('--checkpoint_path', type=str, default="")
+    parser.add_argument('--checkpoint-path', type=str, default="")
     
     args = parser.parse_args()
     return args
@@ -289,7 +289,7 @@ def train(epoch, net, diffusion, schedule_sampler, device, train_data, optimizer
     for l in results['losses']:
         results['losses'][l] /= batch_idx
 
-    return results
+    return results, best_iou
 
 
 def run():
